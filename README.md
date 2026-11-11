@@ -1,6 +1,6 @@
 # TrayDots Rust
 
-[![Release](https://img.shields.io/github/v/release/Abobamonster/TrayDots-Rust)](https://github.com/Abobamonster/TrayDots-Rust/releases/latest)
+[![Version 1.1.1](https://img.shields.io/badge/version-1.1.1-2ea44f)](https://github.com/Abobamonster/TrayDots-Rust/releases/latest)
 ![Windows 10 x64](https://img.shields.io/badge/Windows-10_x64-0078D6)
 ![Rust](https://img.shields.io/badge/Rust-native-DEA584)
 
