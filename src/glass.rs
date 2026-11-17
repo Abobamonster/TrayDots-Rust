@@ -607,7 +607,7 @@ fn create(popup: HWND) -> Option<Flyout> {
         let hwnd = CreateWindowExW(
             WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT,
             GLASS,
-            w!("TrayDots Icons"),
+            w!("RustDots Icons"),
             WS_POPUP,
             bounds.left,
             bounds.top,

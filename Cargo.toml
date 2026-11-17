@@ -1,6 +1,6 @@
 [package]
-name = "tray-dots-rust"
-version = "1.2.1"
+name = "rust-dots"
+version = "1.2.2"
 edition = "2024"
 
 [dependencies]

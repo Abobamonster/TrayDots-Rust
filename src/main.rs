@@ -32,7 +32,8 @@ const BUTTON: *const u16 = w!("TrayDotsRust.Ellipsis.1");
 const EXPLORER: *const u16 = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer");
 const RUN: *const u16 = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const AUTO: *const u16 = w!("EnableAutoTray");
-const STARTUP: *const u16 = w!("TrayDotsRust");
+const STARTUP: *const u16 = w!("RustDots");
+const PREVIOUS_STARTUP: *const u16 = w!("TrayDotsRust");
 const TOGGLE: u32 = WM_APP + 1;
 const MENU: u32 = WM_APP + 2;
 const STOP: u32 = WM_APP + 3;
@@ -139,7 +140,8 @@ fn reg_set(
 
 fn startup(enabled: bool) -> Result<()> {
     if !enabled {
-        return delete_reg(RUN, STARTUP);
+        delete_reg(RUN, STARTUP)?;
+        return delete_reg(RUN, PREVIOUS_STARTUP);
     }
     let exe = io_result(env::current_exe())?;
     let quoted = wide(&format!("\"{}\" --background", exe.display()));
@@ -149,21 +151,22 @@ fn startup(enabled: bool) -> Result<()> {
         REG_SZ,
         quoted.as_ptr().cast(),
         (quoted.len() * 2) as u32,
-    )
+    )?;
+    delete_reg(RUN, PREVIOUS_STARTUP)
 }
 
 fn startup_enabled() -> bool {
-    (unsafe {
+    [STARTUP, PREVIOUS_STARTUP].into_iter().any(|name| unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
             RUN,
-            STARTUP,
+            name,
             RRF_RT_REG_SZ,
             null_mut(),
             null_mut(),
             null_mut(),
-        )
-    }) == ERROR_SUCCESS
+        ) == ERROR_SUCCESS
+    })
 }
 
 // The only private Explorer operation used is EnableAutoTray. No callbacks,
@@ -454,7 +457,7 @@ impl TrayUi {
                 self.button = CreateWindowExW(
                     WS_EX_NOACTIVATE | WS_EX_LAYERED,
                     BUTTON,
-                    w!("Скрытые значки (TrayDots Rust)"),
+                    w!("Скрытые значки (RustDots)"),
                     WS_CHILD,
                     0,
                     0,
@@ -575,7 +578,7 @@ fn platform_check() -> Result<()> {
         || version.dwMajorVersion != 10
         || !(19041..22000).contains(&version.dwBuildNumber)
     {
-        Err("TrayDots Rust поддерживает классический трей Windows 10 (2004–22H2).".into())
+        Err("RustDots поддерживает классический трей Windows 10 (2004–22H2).".into())
     } else {
         Ok(())
     }
@@ -618,7 +621,7 @@ fn run() -> Result<()> {
         let root = CreateWindowExW(
             WS_EX_TOOLWINDOW,
             ROOT,
-            w!("TrayDots Rust"),
+            w!("RustDots"),
             WS_POPUP,
             0,
             0,
@@ -696,7 +699,7 @@ fn run() -> Result<()> {
                                     MessageBoxW(
                                         root,
                                         wide(&error).as_ptr(),
-                                        w!("TrayDots Rust"),
+                                        w!("RustDots"),
                                         MB_OK | MB_ICONERROR,
                                     );
                                 }
@@ -709,7 +712,7 @@ fn run() -> Result<()> {
                                 MessageBoxW(
                                     root,
                                     wide(&error).as_ptr(),
-                                    w!("TrayDots Rust"),
+                                    w!("RustDots"),
                                     MB_OK | MB_ICONERROR,
                                 );
                             }
@@ -804,7 +807,7 @@ fn entry() -> Result<()> {
             Ok(())
         }
         Some("--restore") => {
-            let _lock = Lock::acquire(0)?.ok_or("Сначала остановите TrayDots Rust.")?;
+            let _lock = Lock::acquire(0)?.ok_or("Сначала остановите RustDots.")?;
             taskbar::recover();
             glass::recover_mask();
             restore(&journal()?, None)
@@ -827,7 +830,7 @@ fn main() {
                 MessageBoxW(
                     null_mut(),
                     wide(&error).as_ptr(),
-                    w!("TrayDots Rust"),
+                    w!("RustDots"),
                     MB_OK | MB_ICONERROR,
                 );
             }

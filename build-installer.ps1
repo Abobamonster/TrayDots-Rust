@@ -8,9 +8,9 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Could not read the Cargo package version.' }
     $version = ($metadata | ConvertFrom-Json).packages[0].version
     cargo build --release --locked
-    if ($LASTEXITCODE -ne 0) { throw 'Could not build TrayDots Rust.' }
+    if ($LASTEXITCODE -ne 0) { throw 'Could not build RustDots.' }
 
-    & $compiler /V3 /WX /INPUTCHARSET UTF8 "/DAPP_VERSION=$version" (Join-Path $PSScriptRoot 'installer\TrayDots.nsi')
+    & $compiler /V3 /WX /INPUTCHARSET UTF8 "/DAPP_VERSION=$version" (Join-Path $PSScriptRoot 'installer\RustDots.nsi')
     if ($LASTEXITCODE -ne 0) { throw 'Could not build the Windows installer.' }
 } finally {
     Pop-Location

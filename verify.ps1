@@ -1,5 +1,5 @@
 param(
-    [string]$Executable = "$PSScriptRoot\target\release\tray-dots-rust.exe",
+    [string]$Executable = "$PSScriptRoot\target\release\rust-dots.exe",
     [int]$IdleSeconds = 120,
     [int]$Cycles = 60,
     [string]$Report = "$PSScriptRoot\verification.json",
@@ -7,6 +7,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $Executable = (Resolve-Path -LiteralPath $Executable).Path
+$ProcessName = [IO.Path]::GetFileNameWithoutExtension($Executable)
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -73,7 +74,7 @@ function Get-AutoTray {
     Get-ItemPropertyValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer' -Name EnableAutoTray -ErrorAction SilentlyContinue
 }
 function Get-Samples {
-    $procs = Get-Process -Name 'tray-dots-rust' | Where-Object Path -eq $Executable
+    $procs = Get-Process -Name $ProcessName | Where-Object Path -eq $Executable
     Assert-True (@($procs).Count -eq 2) 'Expected main and recovery processes.'
     $rows = @($procs | ForEach-Object {
         [ordered]@{
@@ -108,7 +109,7 @@ function Find-Button {
     [TrayDotsProbe]::Child($trayWnd, 'TrayDotsRust.Ellipsis.1')
 }
 $root = [TrayDotsProbe]::Top('TrayDotsRust.Controller.1')
-Assert-True ($root -eq [IntPtr]::Zero) 'Stop TrayDots Rust before running verification.'
+Assert-True ($root -eq [IntPtr]::Zero) 'Stop RustDots before running verification.'
 $previous = Get-AutoTray
 $shellWnd = [TrayDotsProbe]::Top('Shell_TrayWnd')
 $trayWnd = [TrayDotsProbe]::Child($shellWnd, 'TrayNotifyWnd')
