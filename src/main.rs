@@ -4,6 +4,7 @@
 mod glass;
 
 use std::{
+    cell::Cell,
     env,
     ffi::c_void,
     fs, io,
@@ -19,7 +20,7 @@ use windows_sys::{
         Foundation::*,
         Graphics::Gdi::*,
         System::{Com::*, LibraryLoader::*, Registry::*, SystemInformation::*, Threading::*},
-        UI::{HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+        UI::{Accessibility::*, HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
     },
     core::{BOOL, GUID, w},
 };
@@ -34,7 +35,12 @@ const STARTUP: *const u16 = w!("TrayDotsRust");
 const TOGGLE: u32 = WM_APP + 1;
 const MENU: u32 = WM_APP + 2;
 const STOP: u32 = WM_APP + 3;
+const SYNC_TRAY: u32 = WM_APP + 4;
 const HOTKEY: i32 = 1;
+
+thread_local! {
+    static TRAY_PARENT: Cell<HWND> = const { Cell::new(null_mut()) };
+}
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -277,6 +283,24 @@ fn signal(message: u32) -> bool {
     !h.is_null() && unsafe { PostMessageW(h, message, 0, 0) != 0 }
 }
 
+unsafe extern "system" fn tray_reordered(
+    _: HWINEVENTHOOK,
+    _: u32,
+    hwnd: HWND,
+    object: i32,
+    child: i32,
+    _: u32,
+    _: u32,
+) {
+    if !hwnd.is_null()
+        && object == OBJID_CLIENT
+        && child == CHILDID_SELF as i32
+        && TRAY_PARENT.get() == hwnd
+    {
+        signal(SYNC_TRAY);
+    }
+}
+
 fn toggle() {
     unsafe {
         let shell = FindWindowW(w!("Shell_TrayWnd"), null());
@@ -378,9 +402,11 @@ impl TrayUi {
                 self.applied = false;
             }
             if shell.is_null() {
+                TRAY_PARENT.set(null_mut());
                 return Ok(());
             }
             let parent = tray(shell);
+            TRAY_PARENT.set(parent);
             if parent.is_null() {
                 return Ok(());
             }
@@ -411,7 +437,7 @@ impl TrayUi {
             if IsWindow(self.button) == 0 || GetParent(self.button) != parent {
                 self.detach();
                 self.button = CreateWindowExW(
-                    WS_EX_NOACTIVATE,
+                    WS_EX_NOACTIVATE | WS_EX_LAYERED,
                     BUTTON,
                     w!("TrayDots Rust"),
                     WS_CHILD,
@@ -427,10 +453,19 @@ impl TrayUi {
                 if self.button.is_null() {
                     return Err(win_error("Create tray button"));
                 }
+                // Give the dots their own surface so a repaint of the native arrow
+                // cannot overwrite them even when our window is already on top.
+                if SetLayeredWindowAttributes(self.button, 0, 255, LWA_ALPHA) == 0 {
+                    let error = win_error("Set tray button opacity");
+                    self.detach();
+                    return Err(error);
+                }
             }
             let mut prev = RECT::default();
             GetWindowRect(self.button, &mut prev);
+            // Explorer can put its arrow above our button without moving either.
             if IsWindowVisible(self.button) == 0
+                || GetTopWindow(parent) != self.button
                 || [prev.left, prev.top, prev.right, prev.bottom]
                     != [rect.left, rect.top, rect.right, rect.bottom]
             {
@@ -581,6 +616,15 @@ fn run() -> Result<()> {
         if SetTimer(root, 1, 2000, None) == 0 {
             return Err(win_error("SetTimer"));
         }
+        let reorder_hook = SetWinEventHook(
+            EVENT_OBJECT_REORDER,
+            EVENT_OBJECT_REORDER,
+            null_mut(),
+            Some(tray_reordered),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        );
         RegisterHotKey(
             root,
             HOTKEY,
@@ -625,6 +669,10 @@ fn run() -> Result<()> {
                             glass::sync(root);
                             continue;
                         }
+                        SYNC_TRAY => {
+                            let _ = ui.sync(&state);
+                            continue;
+                        }
                         WM_TIMER => {
                             match ui.sync(&state) {
                                 Ok(()) => failures = 0,
@@ -645,6 +693,9 @@ fn run() -> Result<()> {
             }
             Ok(())
         })();
+        if !reorder_hook.is_null() {
+            UnhookWinEvent(reorder_hook);
+        }
         glass::close(root);
         ui.detach();
         KillTimer(root, 1);

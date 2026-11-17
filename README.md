@@ -1,6 +1,6 @@
 # TrayDots Rust
 
-[![Version 1.1.1](https://img.shields.io/badge/version-1.1.1-2ea44f)](https://github.com/Abobamonster/TrayDots-Rust/releases/latest)
+[![Version 1.1.2](https://img.shields.io/badge/version-1.1.2-2ea44f)](https://github.com/Abobamonster/TrayDots-Rust/releases/latest)
 ![Windows 10 x64](https://img.shields.io/badge/Windows-10_x64-0078D6)
 ![Rust](https://img.shields.io/badge/Rust-native-DEA584)
 
@@ -29,12 +29,14 @@ TrayDots Rust заменяет стрелку скрытых значков Wind
 
 ## Сборка и замер
 
+Для сборки нужен Rust с целью `x86_64-pc-windows-msvc`.
+
 ```powershell
 cargo build --release --locked
 .\verify.ps1
 ```
 
-`verify.ps1` нужно запускать при остановленном TrayDots Rust и на видимой панели задач. Он проверяет, что кнопка находится на месте штатной стрелки, многократно открывает и закрывает панель, измеряет память и CPU обоих процессов, проверяет обычный выход и принудительное завершение. Результат пишется в `verification.json`.
+`verify.ps1` нужно запускать при остановленном TrayDots Rust и на видимой панели задач. Он проверяет, что кнопка остаётся доступна после перестановки элементов трея, многократно открывает и закрывает панель, измеряет память и CPU обоих процессов, проверяет обычный выход и принудительное завершение. Результат пишется в `verification.json`.
 
 В простое нет WinForms, обработки изображений или записи статуса на диск. Основной процесс ждёт сообщения Windows; раз в две секунды проверяет существование и геометрию кнопки. Для сортировки копии значков берутся при открытии и освобождаются при закрытии. Если раскладка Explorer несовместима, остаётся штатное меню. Процесс восстановления ждёт завершения через системный дескриптор. Для переключения режима трея используется закрытый вызов Explorer [ITrayNotify::EnableAutoTray](https://github.com/cairoshell/ManagedShell/blob/master/src/ManagedShell.WindowsTray/TrayNotify.cs). Windows 11 не поддерживается.
 

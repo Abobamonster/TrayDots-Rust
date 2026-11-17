@@ -24,6 +24,11 @@ public static class TrayDotsProbe {
         return GetLayeredWindowAttributes(w, out key, out alpha, out flags) && (flags & 2) != 0 && alpha == 1;
     }
     [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(Point p);
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr w, IntPtr after, int x, int y, int cx, int cy, uint flags);
+    public static bool RaiseWindow(IntPtr w) {
+        const uint NoSize = 0x0001, NoMove = 0x0002, NoActivate = 0x0010;
+        return SetWindowPos(w, IntPtr.Zero, 0, 0, 0, 0, NoSize | NoMove | NoActivate);
+    }
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr w, uint m, IntPtr wp, IntPtr lp);
     public static bool OpenWithoutOpaqueFrame(IntPtr button, IntPtr popup) {
         if (!PostMessage(button, 0x0202, IntPtr.Zero, IntPtr.Zero)) return false;
@@ -111,6 +116,9 @@ try {
     $center.X = [int](($rect.L + $rect.R)/2)
     $center.Y = [int](($rect.T + $rect.B)/2)
     Assert-True ([TrayDotsProbe]::WindowFromPoint($center) -eq $button) 'Ellipsis is not the click target.'
+    $arrow = [TrayDotsProbe]::Child($trayWnd, 'Button')
+    Assert-True ([TrayDotsProbe]::RaiseWindow($arrow)) 'Could not reproduce the native arrow covering the ellipsis.'
+    Wait-Until { [TrayDotsProbe]::WindowFromPoint($center) -eq $button } 'The ellipsis did not regain the click target when the native arrow was raised.'
     $collapsedCount = [TrayDotsProbe]::Count($mainToolbar)
     $overflow = [TrayDotsProbe]::Top('NotifyIconOverflowWindow')
     $overflowToolbar = [TrayDotsProbe]::Child($overflow, 'ToolbarWindow32')
@@ -170,6 +178,7 @@ try {
         peak_working_set_bytes_both = ($samples.working_set_bytes | Measure-Object -Maximum).Maximum
         normal_exit_restored = $true
         force_stop_restored = $true
+        click_target_restored_after_reorder = $true
         glass_opened = $true
         native_masked_before_first_visible_frame = $true
         native_toolbar_hit_test = $true
