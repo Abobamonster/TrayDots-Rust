@@ -2,7 +2,8 @@ param(
     [string]$Executable = "$PSScriptRoot\target\release\tray-dots-rust.exe",
     [int]$IdleSeconds = 120,
     [int]$Cycles = 60,
-    [string]$Report = "$PSScriptRoot\verification.json"
+    [string]$Report = "$PSScriptRoot\verification.json",
+    [switch]$LeaveRunning
 )
 $ErrorActionPreference = 'Stop'
 $Executable = (Resolve-Path -LiteralPath $Executable).Path
@@ -14,8 +15,17 @@ public static class TrayDotsProbe {
     [StructLayout(LayoutKind.Sequential)] public struct Point { public int X,Y; }
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindow(string c, string n);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string c, string n);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern IntPtr GetProp(IntPtr w, string name);
     public static IntPtr Top(string c) { return FindWindow(c, null); }
     public static IntPtr Child(IntPtr parent, string c) { return FindWindowEx(parent, IntPtr.Zero, c, null); }
+    public static bool HasTrayDotsTaskbarAccent() {
+        if (GetProp(Top("Shell_TrayWnd"), "TrayDotsRust.TaskbarAccent.1") != IntPtr.Zero) return true;
+        IntPtr secondary = IntPtr.Zero;
+        while ((secondary = FindWindowEx(IntPtr.Zero, secondary, "Shell_SecondaryTrayWnd", null)) != IntPtr.Zero) {
+            if (GetProp(secondary, "TrayDotsRust.TaskbarAccent.1") != IntPtr.Zero) return true;
+        }
+        return false;
+    }
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr w);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr w, out Rect r);
     [DllImport("user32.dll")] public static extern bool GetLayeredWindowAttributes(IntPtr w, out uint key, out byte alpha, out uint flags);
@@ -90,7 +100,7 @@ function Is-GlassVisible {
     [TrayDotsProbe]::IsWindowVisible([TrayDotsProbe]::Top('TrayDotsRust.OverflowGlass.1'))
 }
 function Start-Tray {
-    $proc = Start-Process -FilePath $Executable -WindowStyle Hidden -PassThru
+    $proc = Start-Process -FilePath $Executable -ArgumentList '--background' -WindowStyle Hidden -PassThru
     Wait-Until { (Get-AutoTray) -eq 1 -and [TrayDotsProbe]::IsWindowVisible((Find-Button)) } 'Tray button did not appear.'
     $proc
 }
@@ -155,14 +165,27 @@ try {
     Assert-True ($privateDelta -lt 2MB) 'Private memory grew by at least 2 MiB while idle.'
     Assert-True (($idleEnd.handles - $idleStart.handles) -lt 10) 'Handle count grew while idle.'
     Start-Process -FilePath $Executable -ArgumentList '--quit' -WindowStyle Hidden -Wait
-    Wait-Until { $proc.Refresh(); $proc.HasExited -and (Get-AutoTray) -eq $previous -and !(Test-Path -LiteralPath $restoreFile) } 'Graceful exit did not restore settings.'
+    Wait-Until { $proc.Refresh(); $proc.HasExited -and (Get-AutoTray) -eq $previous -and !(Test-Path -LiteralPath $restoreFile) -and ![TrayDotsProbe]::HasTrayDotsTaskbarAccent() } 'Graceful exit did not restore tray or taskbar settings.'
     $proc = Start-Tray
     [void][TrayDotsProbe]::PostMessage((Find-Button), 0x0202, [IntPtr]::Zero, [IntPtr]::Zero)
     Wait-Until { (Is-GlassVisible) -and [TrayDotsProbe]::IsMasked($overflow) } 'Glass not ready for the recovery test.'
     Stop-Process -Id $proc.Id -Force
-    Wait-Until { (Get-AutoTray) -eq $previous -and !(Test-Path -LiteralPath $restoreFile) -and ![TrayDotsProbe]::IsMasked($overflow) } 'Recovery process did not restore settings or native opacity.'
+    Wait-Until { (Get-AutoTray) -eq $previous -and !(Test-Path -LiteralPath $restoreFile) -and ![TrayDotsProbe]::IsMasked($overflow) -and ![TrayDotsProbe]::HasTrayDotsTaskbarAccent() } 'Recovery process did not restore tray or taskbar settings.'
     $restoredCount = [TrayDotsProbe]::Count($mainToolbar)
     Assert-True ($restoredCount -eq $beforeCount) 'The initial toolbar button count was not restored.'
+    $proc = Start-Tray
+    $button = Find-Button
+    if (Is-OverflowVisible) {
+        [void][TrayDotsProbe]::PostMessage($button, 0x0202, [IntPtr]::Zero, [IntPtr]::Zero)
+        Wait-Until { !(Is-OverflowVisible) -and !(Is-GlassVisible) } 'Could not close the overflow left open by the forced-stop test.'
+    }
+    Assert-True ([TrayDotsProbe]::OpenWithoutOpaqueFrame($button, $overflow)) 'Transparency was lost after recovery and restart.'
+    [void][TrayDotsProbe]::PostMessage($button, 0x0202, [IntPtr]::Zero, [IntPtr]::Zero)
+    Wait-Until { !(Is-OverflowVisible) -and !(Is-GlassVisible) } 'Could not close the post-recovery overflow.'
+    [void][TrayDotsProbe]::PostMessage($arrow, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
+    Wait-Until { (Is-GlassVisible) -and [TrayDotsProbe]::IsMasked($overflow) } 'An overflow opened by Explorer stayed opaque.'
+    [void][TrayDotsProbe]::PostMessage($button, 0x0202, [IntPtr]::Zero, [IntPtr]::Zero)
+    Wait-Until { !(Is-OverflowVisible) -and !(Is-GlassVisible) } 'Could not close the overflow opened by Explorer.'
     [ordered]@{
         os_build = (Get-CimInstance Win32_OperatingSystem).BuildNumber
         exe_bytes = (Get-Item -LiteralPath $Executable).Length
@@ -178,6 +201,8 @@ try {
         peak_working_set_bytes_both = ($samples.working_set_bytes | Measure-Object -Maximum).Maximum
         normal_exit_restored = $true
         force_stop_restored = $true
+        transparent_after_recovery_and_restart = $true
+        overflow_opened_by_explorer_decorated = $true
         click_target_restored_after_reorder = $true
         glass_opened = $true
         native_masked_before_first_visible_frame = $true
@@ -186,7 +211,10 @@ try {
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Report -Encoding utf8
     Get-Content -LiteralPath $Report -TotalCount 15
 } finally {
-    if ([TrayDotsProbe]::Top('TrayDotsRust.Controller.1') -ne [IntPtr]::Zero) {
+    $running = [TrayDotsProbe]::Top('TrayDotsRust.Controller.1') -ne [IntPtr]::Zero
+    if ($LeaveRunning -and !$running) {
+        $null = Start-Tray
+    } elseif (!$LeaveRunning -and $running) {
         Start-Process -FilePath $Executable -ArgumentList '--quit' -WindowStyle Hidden -Wait
     }
 }

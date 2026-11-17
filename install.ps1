@@ -49,27 +49,12 @@ if ($legacyRun -eq ('"' + $legacy + '"')) {
 }
 
 $shell = New-Object -ComObject WScript.Shell
-$desktop = [Environment]::GetFolderPath('Desktop')
 $programs = [Environment]::GetFolderPath('Programs')
 $folder = Join-Path $programs 'TrayDots'
 New-Item -ItemType Directory -Path $folder -Force | Out-Null
-$desktopLink = Join-Path $desktop 'TrayDots.lnk'
-if (Test-Path -LiteralPath $desktopLink) {
-    $existing = $shell.CreateShortcut($desktopLink)
-    if ($existing.TargetPath -notin @($legacy, $installed)) {
-        $desktopLink = Join-Path $desktop 'TrayDots Rust.lnk'
-    }
-}
-$links = @(
-    @{ Path = $desktopLink; Arguments = '' },
-    @{ Path = (Join-Path $folder 'TrayDots.lnk'); Arguments = '' },
-    @{ Path = (Join-Path $folder 'Остановить и убрать автозапуск.lnk'); Arguments = '--uninstall' }
-)
-foreach ($entry in $links) {
-    $link = $shell.CreateShortcut($entry.Path)
-    $link.TargetPath = $installed
-    $link.WorkingDirectory = $directory
-    $link.Arguments = $entry.Arguments
-    $link.Save()
-}
+$link = $shell.CreateShortcut((Join-Path $folder 'TrayDots.lnk'))
+$link.TargetPath = $installed
+$link.WorkingDirectory = $directory
+$link.Arguments = ''
+$link.Save()
 Write-Output "Installed and started: $installed"

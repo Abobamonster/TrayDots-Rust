@@ -14,7 +14,7 @@ const ICON_LIMIT: usize = 128;
 const SAMPLE_SIZE: i32 = 24;
 
 thread_local! {
-    static ACTIVE: RefCell<Option<Flyout>> = const { RefCell::new(None) };
+    static ACTIVE: RefCell<Option<OpenPopup>> = const { RefCell::new(None) };
 }
 
 fn overflow() -> HWND {
@@ -263,16 +263,41 @@ fn color_group(r: u8, g: u8, b: u8) -> u8 {
 }
 
 struct Slot {
-    button: TBBUTTON,
+    command: (i32, u8),
     icon: Icon,
     group: u8,
 }
 
-fn snapshot(bar: HWND, remote: &mut Remote, count: usize) -> Option<Vec<Slot>> {
+type CommandState = (i32, u8);
+const HIDDEN: u8 = TBSTATE_HIDDEN as u8;
+const WRAP: u8 = TBSTATE_WRAP as u8;
+
+fn button_order(bar: HWND, remote: &mut Remote, count: usize) -> Option<Vec<CommandState>> {
+    (0..count)
+        .map(|i| {
+            let button = remote.query::<TBBUTTON>(bar, TB_GETBUTTON, i)?;
+            Some((button.idCommand, button.fsState))
+        })
+        .collect()
+}
+
+fn snapshot(
+    bar: HWND,
+    remote: &mut Remote,
+    count: usize,
+) -> Option<(Vec<CommandState>, Vec<Slot>)> {
     let mut sample = Surface::new(SAMPLE_SIZE, SAMPLE_SIZE)?;
+    let mut original = Vec::with_capacity(count);
     let mut slots = Vec::with_capacity(count);
-    for i in 0..count {
-        let button = remote.query::<TBBUTTON>(bar, TB_GETBUTTON, i)?;
+    for index in 0..count {
+        let button = remote.query::<TBBUTTON>(bar, TB_GETBUTTON, index)?;
+        let command = (button.idCommand, button.fsState);
+        original.push(command);
+        // Explorer keeps records for icons assigned to the main tray here too.
+        // These entries have no overflow rectangle.
+        if command.1 & HIDDEN != 0 {
+            continue;
+        }
         let record: TrayData = remote.read(button.dwData as *const c_void)?;
         let icon = unsafe { CopyIcon(record.icon) };
         if icon.is_null() {
@@ -281,12 +306,12 @@ fn snapshot(bar: HWND, remote: &mut Remote, count: usize) -> Option<Vec<Slot>> {
         let icon = Icon(icon);
         let group = sample.group(icon.0);
         slots.push(Slot {
-            button,
+            command,
             icon,
             group,
         });
     }
-    Some(slots)
+    Some((original, slots))
 }
 
 fn command_index(bar: HWND, id: i32) -> Option<usize> {
@@ -294,11 +319,15 @@ fn command_index(bar: HWND, id: i32) -> Option<usize> {
     (i <= ICON_LIMIT).then_some(i)
 }
 
-fn reorder(bar: HWND, desired: &[(i32, u8)]) -> Option<()> {
+fn reorder(bar: HWND, desired: &[CommandState]) -> Option<()> {
     // Wrap belongs to the position in the grid, while all other button flags
     // belong to the original command (including its notification identity).
     if send(bar, TB_BUTTONCOUNT, 0, 0)? != desired.len() {
         return None;
+    }
+    // Check that all commands still exist before moving any of them.
+    for &(id, _) in desired {
+        command_index(bar, id)?;
     }
     for (index, &(id, _)) in desired.iter().enumerate() {
         let old = command_index(bar, id)?;
@@ -307,9 +336,9 @@ fn reorder(bar: HWND, desired: &[(i32, u8)]) -> Option<()> {
         }
     }
     for &(id, state) in desired {
-        if send(bar, TB_GETSTATE, id as usize, 0)? != state as usize
-            && send(bar, TB_SETSTATE, id as usize, state as isize)? == 0
-        {
+        let current = u8::try_from(send(bar, TB_GETSTATE, id as usize, 0)?).ok()?;
+        let updated = (current & !WRAP) | (state & WRAP);
+        if updated != current && send(bar, TB_SETSTATE, id as usize, updated as isize)? == 0 {
             return None;
         }
     }
@@ -318,7 +347,7 @@ fn reorder(bar: HWND, desired: &[(i32, u8)]) -> Option<()> {
 
 struct Order {
     bar: HWND,
-    original: Vec<(i32, u8)>,
+    original: Vec<CommandState>,
 }
 impl Drop for Order {
     fn drop(&mut self) {
@@ -372,6 +401,30 @@ pub fn recover_mask() {
 }
 
 pub struct PopupMask(HWND);
+impl PopupMask {
+    fn acquire(popup: HWND) -> Option<Self> {
+        mask(popup).then(|| Self(popup))
+    }
+
+    fn ensure(&self) -> bool {
+        unsafe {
+            if GetPropW(self.0, MASK).is_null() {
+                return mask(self.0);
+            }
+            let mut alpha = 0;
+            let mut flags = 0;
+            if GetLayeredWindowAttributes(self.0, null_mut(), &mut alpha, &mut flags) != 0
+                && alpha == 1
+                && flags == LWA_ALPHA
+            {
+                return true;
+            }
+            let style = GetWindowLongPtrW(self.0, GWL_EXSTYLE);
+            SetWindowLongPtrW(self.0, GWL_EXSTYLE, style | WS_EX_LAYERED as isize);
+            SetLayeredWindowAttributes(self.0, 0, 1, LWA_ALPHA) != 0
+        }
+    }
+}
 impl Drop for PopupMask {
     fn drop(&mut self) {
         unmask(self.0);
@@ -382,10 +435,10 @@ pub fn mask_before_open() -> Option<PopupMask> {
     let popup = overflow();
     // Explorer normally creates its overflow window before the first click.
     // Mask it while hidden, so the native background never gets a visible frame.
-    if popup.is_null() || unsafe { IsWindowVisible(popup) } != 0 || !mask(popup) {
+    if popup.is_null() || unsafe { IsWindowVisible(popup) } != 0 {
         return None;
     }
-    Some(PopupMask(popup))
+    PopupMask::acquire(popup)
 }
 
 struct Tile {
@@ -396,12 +449,17 @@ struct Flyout {
     hwnd: HWND,
     popup: HWND,
     order: Order,
+    layout: Vec<CommandState>,
     tiles: Vec<Tile>,
     bounds: RECT,
     hover: Option<usize>,
     dark: Surface,
     light: Surface,
-    _mask: PopupMask,
+}
+
+struct OpenPopup {
+    flyout: Flyout,
+    mask: PopupMask,
 }
 impl Drop for Flyout {
     fn drop(&mut self) {
@@ -486,8 +544,7 @@ impl Flyout {
     }
 }
 
-fn create(mask: PopupMask) -> Option<Flyout> {
-    let popup = mask.0;
+fn create(popup: HWND) -> Option<Flyout> {
     unsafe {
         let bar = toolbar(popup);
         if bar.is_null() {
@@ -502,29 +559,33 @@ fn create(mask: PopupMask) -> Option<Flyout> {
             return None;
         }
         let mut remote = Remote::open(bar)?;
-        let mut slots = snapshot(bar, &mut remote, count)?;
-        let original: Vec<_> = slots
-            .iter()
-            .map(|s| (s.button.idCommand, s.button.fsState))
-            .collect();
+        let (original, mut slots) = snapshot(bar, &mut remote, count)?;
+        if slots.is_empty() {
+            return None;
+        }
         let order = Order { bar, original };
         slots.sort_by_key(|s| s.group);
-        let wrap = TBSTATE_WRAP as u8;
-        let desired: Vec<_> = slots
-            .iter()
-            .zip(&order.original)
-            .map(|(s, orig)| {
-                (
-                    s.button.idCommand,
-                    (s.button.fsState & !wrap) | (orig.1 & wrap),
-                )
-            })
-            .collect();
+        let mut desired = order.original.clone();
+        for (position, slot) in desired
+            .iter_mut()
+            .filter(|(_, state)| *state & HIDDEN == 0)
+            .zip(&slots)
+        {
+            *position = (
+                slot.command.0,
+                (slot.command.1 & !WRAP) | (position.1 & WRAP),
+            );
+        }
         reorder(bar, &desired)?;
         let mut origin = POINT::default();
         ClientToScreen(bar, &mut origin);
-        let mut tiles = Vec::with_capacity(count);
-        for (index, slot) in slots.into_iter().enumerate() {
+        let mut tiles = Vec::with_capacity(slots.len());
+        for ((index, _), slot) in desired
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, state))| state & HIDDEN == 0)
+            .zip(slots)
+        {
             let mut rect: RECT = remote.query(bar, TB_GETITEMRECT, index)?;
             OffsetRect(&mut rect, origin.x - bounds.left, origin.y - bounds.top);
             if rect.left < 0
@@ -564,12 +625,12 @@ fn create(mask: PopupMask) -> Option<Flyout> {
             hwnd,
             popup,
             order,
+            layout: desired,
             tiles,
             bounds,
             hover: None,
             dark,
             light,
-            _mask: mask,
         };
         if !flyout.render()
             || SetWindowPos(
@@ -589,21 +650,26 @@ fn create(mask: PopupMask) -> Option<Flyout> {
 }
 
 pub fn finish_toggle(root: HWND, mask: Option<PopupMask>) {
-    sync(root);
-    let Some(mask) = mask else { return };
-    if unsafe { IsWindowVisible(mask.0) } == 0 {
-        return;
-    }
-    ACTIVE.with(|cell| {
-        let mut active = cell.borrow_mut();
-        *active = create(mask);
-        if active.is_some() && unsafe { SetTimer(root, TIMER, 80, None) } == 0 {
-            drop(active.take());
-        }
-    });
+    reconcile(root, mask, false);
 }
 
-pub fn sync(root: HWND) {
+pub fn sync(root: HWND, check_layout: bool) {
+    reconcile(root, None, check_layout);
+}
+
+fn layout_changed(flyout: &Flyout) -> bool {
+    let bar = flyout.order.bar;
+    let count = flyout.layout.len();
+    Remote::open(bar)
+        .and_then(|mut remote| button_order(bar, &mut remote, count))
+        .is_some_and(|current| {
+            current.iter().zip(&flyout.layout).any(|(current, old)| {
+                current.0 != old.0 || (current.1 ^ old.1) & (HIDDEN | WRAP) != 0
+            })
+        })
+}
+
+fn reconcile(root: HWND, prepared_mask: Option<PopupMask>, check_layout: bool) {
     let popup = overflow();
     ACTIVE.with(|cell| {
         let mut active = cell.borrow_mut();
@@ -613,24 +679,49 @@ pub fn sync(root: HWND) {
                 KillTimer(root, TIMER);
                 return;
             }
-            if let Some(flyout) = active.as_mut() {
-                let mut bounds = RECT::default();
-                if popup != flyout.popup
-                    || GetWindowRect(popup, &mut bounds) == 0
-                    || send(flyout.order.bar, TB_BUTTONCOUNT, 0, 0) != Some(flyout.tiles.len())
+            if active.as_ref().is_some_and(|open| open.mask.0 != popup) {
+                drop(active.take());
+                KillTimer(root, TIMER);
+            }
+            let mut bounds = RECT::default();
+            if GetWindowRect(popup, &mut bounds) == 0 {
+                return;
+            }
+            let mut pending_mask = prepared_mask.filter(|mask| mask.0 == popup);
+            if let Some(open) = active.as_mut() {
+                let flyout = &mut open.flyout;
+                let needs_rebuild = EqualRect(&bounds, &flyout.bounds) == 0
+                    || toolbar(popup) != flyout.order.bar
+                    || send(flyout.order.bar, TB_BUTTONCOUNT, 0, 0) != Some(flyout.layout.len())
+                    || (check_layout && layout_changed(flyout));
+                if needs_rebuild {
+                    if let Some(OpenPopup { flyout, mask }) = active.take() {
+                        // Restore the native order before taking a fresh snapshot.
+                        drop(flyout);
+                        pending_mask = Some(mask);
+                    }
+                    KillTimer(root, TIMER);
+                }
+            }
+            if active.is_none() {
+                let Some(mask) = pending_mask.or_else(|| PopupMask::acquire(popup)) else {
+                    return;
+                };
+                if mask.ensure()
+                    && let Some(flyout) = create(popup)
+                    && SetTimer(root, TIMER, 80, None) != 0
                 {
+                    *active = Some(OpenPopup { flyout, mask });
+                }
+                return;
+            }
+            if let Some(open) = active.as_mut() {
+                if !open.mask.ensure() {
                     drop(active.take());
                     KillTimer(root, TIMER);
                     return;
                 }
-                let old = &flyout.bounds;
-                if (bounds.left, bounds.top, bounds.right, bounds.bottom)
-                    != (old.left, old.top, old.right, old.bottom)
-                {
-                    drop(active.take());
-                    KillTimer(root, TIMER);
-                    return;
-                }
+                let flyout = &mut open.flyout;
                 let mut cursor = POINT::default();
                 GetCursorPos(&mut cursor);
                 let x = cursor.x - bounds.left;
@@ -649,6 +740,10 @@ pub fn sync(root: HWND) {
             }
         }
     });
+}
+
+pub fn is_overflow(hwnd: HWND) -> bool {
+    !hwnd.is_null() && hwnd == overflow()
 }
 
 pub fn close(root: HWND) {

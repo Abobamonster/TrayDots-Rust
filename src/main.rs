@@ -2,6 +2,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 mod glass;
+mod taskbar;
 
 use std::{
     cell::Cell,
@@ -36,6 +37,8 @@ const TOGGLE: u32 = WM_APP + 1;
 const MENU: u32 = WM_APP + 2;
 const STOP: u32 = WM_APP + 3;
 const SYNC_TRAY: u32 = WM_APP + 4;
+const RELOAD_TASKBAR: u32 = WM_APP + 5;
+const SYNC_OVERFLOW: u32 = WM_APP + 6;
 const HOTKEY: i32 = 1;
 
 thread_local! {
@@ -257,6 +260,7 @@ fn recover_after(pid: u32) -> Result<()> {
         }
     }
     let _lock = Lock::acquire(INFINITE)?.ok_or("Recovery lock not acquired")?;
+    taskbar::recover();
     glass::recover_mask();
     let path = journal()?;
     for _ in 0..4 {
@@ -301,6 +305,20 @@ unsafe extern "system" fn tray_reordered(
     }
 }
 
+unsafe extern "system" fn overflow_visibility(
+    _: HWINEVENTHOOK,
+    _: u32,
+    hwnd: HWND,
+    object: i32,
+    child: i32,
+    _: u32,
+    _: u32,
+) {
+    if object == OBJID_WINDOW && child == CHILDID_SELF as i32 && glass::is_overflow(hwnd) {
+        signal(SYNC_OVERFLOW);
+    }
+}
+
 fn toggle() {
     unsafe {
         let shell = FindWindowW(w!("Shell_TrayWnd"), null());
@@ -342,6 +360,15 @@ unsafe extern "system" fn root_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             PostQuitMessage(0);
             0
         }
+        WM_DISPLAYCHANGE
+        | WM_THEMECHANGED
+        | WM_DWMCOMPOSITIONCHANGED
+        | WM_POWERBROADCAST
+        | WM_SETTINGCHANGE
+        | WM_SYSCOLORCHANGE => {
+            taskbar::schedule(hwnd, true);
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
 }
@@ -365,18 +392,6 @@ unsafe extern "system" fn button_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 GetClientRect(hwnd, &mut rect);
                 SetDCBrushColor(dc, 0x302821);
                 FillRect(dc, &rect, GetStockObject(DC_BRUSH) as HBRUSH);
-                let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
-                let old_brush = SelectObject(dc, GetStockObject(DC_BRUSH));
-                SetDCBrushColor(dc, 0xf4f4f4);
-                let x = rect.right / 2;
-                let y = rect.bottom / 2;
-                let r = (rect.right / 8).max(1);
-                for i in -1..=1 {
-                    let d = x + i * (2 * r + 2);
-                    Ellipse(dc, d - r, y - r, d + r, y + r);
-                }
-                SelectObject(dc, old_brush);
-                SelectObject(dc, old_pen);
             }
             EndPaint(hwnd, &ps);
             0
@@ -439,7 +454,7 @@ impl TrayUi {
                 self.button = CreateWindowExW(
                     WS_EX_NOACTIVATE | WS_EX_LAYERED,
                     BUTTON,
-                    w!("TrayDots Rust"),
+                    w!("Скрытые значки (TrayDots Rust)"),
                     WS_CHILD,
                     0,
                     0,
@@ -453,9 +468,9 @@ impl TrayUi {
                 if self.button.is_null() {
                     return Err(win_error("Create tray button"));
                 }
-                // Give the dots their own surface so a repaint of the native arrow
-                // cannot overwrite them even when our window is already on top.
-                if SetLayeredWindowAttributes(self.button, 0, 255, LWA_ALPHA) == 0 {
+                // Let Explorer draw its themed arrow under a nearly invisible,
+                // full-size click target. Zero alpha would pass clicks through.
+                if SetLayeredWindowAttributes(self.button, 0, 1, LWA_ALPHA) == 0 {
                     let error = win_error("Set tray button opacity");
                     self.detach();
                     return Err(error);
@@ -503,7 +518,7 @@ impl Drop for TrayUi {
     }
 }
 
-fn context_menu(root: HWND) -> Result<bool> {
+fn context_menu(root: HWND, appearance: &mut taskbar::Taskbar) -> Result<bool> {
     unsafe {
         let menu = CreatePopupMenu();
         if menu.is_null() {
@@ -517,6 +532,8 @@ fn context_menu(root: HWND) -> Result<bool> {
             2,
             w!("Запускать вместе с Windows"),
         );
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        appearance.append_menu(menu);
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         AppendMenuW(menu, MF_STRING, 3, w!("Выйти и вернуть значки"));
         let mut pt = POINT::default();
@@ -537,7 +554,8 @@ fn context_menu(root: HWND) -> Result<bool> {
             1 => toggle(),
             2 => startup(!enabled)?,
             3 => return Ok(true),
-            _ => {}
+            0 => {}
+            command => appearance.command(root, command as u32)?,
         }
         Ok(false)
     }
@@ -570,6 +588,7 @@ fn run() -> Result<()> {
         return Ok(());
     };
     let state = journal()?;
+    taskbar::recover();
     glass::recover_mask();
     restore(&state, None)?;
     let exe = io_result(env::current_exe())?;
@@ -625,6 +644,15 @@ fn run() -> Result<()> {
             0,
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
         );
+        let overflow_hook = SetWinEventHook(
+            EVENT_OBJECT_SHOW,
+            EVENT_OBJECT_HIDE,
+            null_mut(),
+            Some(overflow_visibility),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        );
         RegisterHotKey(
             root,
             HOTKEY,
@@ -638,6 +666,7 @@ fn run() -> Result<()> {
             applied: false,
             needs_restore: false,
         };
+        let mut appearance = taskbar::Taskbar::new();
         let mut failures = 0;
         let result = (|| {
             // Explorer may still be initializing at logon. Give the timer a few
@@ -645,6 +674,7 @@ fn run() -> Result<()> {
             if ui.sync(&state).is_err() {
                 failures = 1;
             }
+            appearance.refresh(true);
             let mut msg = MSG::default();
             loop {
                 match GetMessageW(&mut msg, null_mut(), 0, 0) {
@@ -660,13 +690,42 @@ fn run() -> Result<()> {
                             continue;
                         }
                         MENU => {
-                            if context_menu(root)? {
-                                break;
+                            match context_menu(root, &mut appearance) {
+                                Ok(true) => break,
+                                Err(error) => {
+                                    MessageBoxW(
+                                        root,
+                                        wide(&error).as_ptr(),
+                                        w!("TrayDots Rust"),
+                                        MB_OK | MB_ICONERROR,
+                                    );
+                                }
+                                _ => {}
                             }
                             continue;
                         }
+                        RELOAD_TASKBAR => {
+                            if let Err(error) = appearance.reload() {
+                                MessageBoxW(
+                                    root,
+                                    wide(&error).as_ptr(),
+                                    w!("TrayDots Rust"),
+                                    MB_OK | MB_ICONERROR,
+                                );
+                            }
+                            continue;
+                        }
+                        SYNC_OVERFLOW => {
+                            glass::sync(root, false);
+                            continue;
+                        }
                         WM_TIMER if msg.wParam == glass::TIMER => {
-                            glass::sync(root);
+                            glass::sync(root, false);
+                            continue;
+                        }
+                        WM_TIMER if msg.wParam == taskbar::TIMER => {
+                            let force = taskbar::consume_timer(root);
+                            appearance.refresh(force);
                             continue;
                         }
                         SYNC_TRAY => {
@@ -674,6 +733,8 @@ fn run() -> Result<()> {
                             continue;
                         }
                         WM_TIMER => {
+                            appearance.refresh(false);
+                            glass::sync(root, true);
                             match ui.sync(&state) {
                                 Ok(()) => failures = 0,
                                 Err(err) => {
@@ -693,8 +754,13 @@ fn run() -> Result<()> {
             }
             Ok(())
         })();
+        drop(appearance);
+        taskbar::consume_timer(root);
         if !reorder_hook.is_null() {
             UnhookWinEvent(reorder_hook);
+        }
+        if !overflow_hook.is_null() {
+            UnhookWinEvent(overflow_hook);
         }
         glass::close(root);
         ui.detach();
@@ -720,6 +786,14 @@ fn entry() -> Result<()> {
             signal(TOGGLE);
             Ok(())
         }
+        Some("--menu") => {
+            signal(MENU);
+            Ok(())
+        }
+        Some("--taskbar-reload") => {
+            signal(RELOAD_TASKBAR);
+            Ok(())
+        }
         Some("--quit") => {
             signal(STOP);
             Ok(())
@@ -731,6 +805,7 @@ fn entry() -> Result<()> {
         }
         Some("--restore") => {
             let _lock = Lock::acquire(0)?.ok_or("Сначала остановите TrayDots Rust.")?;
+            taskbar::recover();
             glass::recover_mask();
             restore(&journal()?, None)
         }
